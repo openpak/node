@@ -1,0 +1,119 @@
+# An OpenPak region node: the relays a room is served from, and nothing else.
+#
+# Accounts, friends, matchmaking and the console-facing services stay on openpak.org. This box
+# runs a Photon game server and a TURN server, announces its addresses to openpak.org once a
+# minute, and gets rooms handed to it whenever someone in its country hosts one. If it dies,
+# rooms on it end and everyone re-matches elsewhere; nobody loses anything.
+#
+#   cp example.env .env && edit          # never commit .env
+#   podman compose up -d   (or docker compose)
+services:
+  photon:
+    image: ghcr.io/openpak/photon:latest
+    restart: unless-stopped
+    network_mode: host                   # UDP game port must reach the box directly
+    environment:
+      OPENPAK_AdvertisedHost: ${PUBLIC_IP}
+      OPENPAK_AllowAnonymousLan: "false"
+      OPENPAK_Server__Secret: ${PHOTON_SECRET}          # home's token secret: validates the tokens home minted
+      OPENPAK_Server__Ports__GameServer: "22002"
+      OPENPAK_Server__Ports__GameServerAlt: "22012"
+      OPENPAK_Server__HealthPort: "8080"
+      OPENPAK_Federation__NodeId: ${NODE_ID}
+      OPENPAK_Federation__HomeUrl: ${PHOTON_HOME_URL:-https://photon.openpak.org}
+      OPENPAK_Database__Provider: sqlite
+    volumes:
+      - photon-data:/app/data
+
+  turn:
+    # coturn with the Pia interoperability patch; same build the home Stardew server uses.
+    build:
+      context: ../../platforms/switch/games/npln/titles/stardew-valley/deploy/oci
+      dockerfile: Dockerfile.coturn
+    restart: unless-stopped
+    network_mode: host                   # relay ports 49152-65535/udp must reach the box directly
+    command:
+      - "-n"
+      - "--no-tls"
+      - "--no-dtls"
+      - "--listening-port=3478"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${NPLN_TURN_SECRET}"     # home mints the credentials; this must match
+      - "--realm=openpak.org"
+      - "--fingerprint"
+      - "--external-ip=${PUBLIC_IP}"
+      - "--min-port=49152"
+      - "--max-port=65535"
+      - "--log-file=stdout"
+
+  announce:
+    # Joins this server to its node once (the node key buys a server key, kept in the
+    # announce-state volume), then once a minute announces the roles this box runs and
+    # what it is: cores, RAM, disk, SSD or not, its addresses and declared port speed.
+    # When home says a self-test is due (once a day), it downloads and uploads one timed
+    # transfer; home measures both itself. Reports are self-declared: they decide whether
+    # the node is in rotation, and approval stays a person's call at openpak.org.
+    # Still a curl loop; a Go sidecar when the report needs more than this.
+    image: docker.io/curlimages/curl:8.10.1
+    restart: unless-stopped
+    environment:
+      OPENPAK_NODE_KEY: ${OPENPAK_NODE_KEY}
+      SERVER_NAME: ${SERVER_NAME:-s1}
+      PUBLIC_IP: ${PUBLIC_IP}
+      PUBLIC_IPV6: ${PUBLIC_IPV6:-}
+      PORT_MBPS: ${PORT_MBPS:-1000}
+      DISK_SSD: ${DISK_SSD:-auto}
+      ANNOUNCE_SERVICES: ${ANNOUNCE_SERVICES:-}   # e.g. "turn":"203.0.113.9:3478" on a TURN-only server
+      FEDERATION_URL: ${FEDERATION_URL:-https://openpak.org/api/v1/federation}
+    volumes:
+      - announce-state:/state
+      - ${DATA_DIR:-/}:/host:ro            # the filesystem whose size is reported as disk
+    command:
+      - sh
+      - -c
+      - |
+        KEYFILE=/state/server.key
+        while [ ! -s "$$KEYFILE" ]; do
+          curl -fsS -4 -m 15 -X POST "$$FEDERATION_URL/join" \
+            -H "Authorization: Bearer $$OPENPAK_NODE_KEY" -H "Content-Type: application/json" \
+            -d "{\"name\":\"$$SERVER_NAME\"}" | sed -n 's/.*"key": *"\(opsrv_[^"]*\)".*/\1/p' > "$$KEYFILE"
+          [ -s "$$KEYFILE" ] || { echo "join failed; retrying in a minute"; sleep 60; }
+        done
+        KEY=$$(cat "$$KEYFILE")
+        [ -n "$$ANNOUNCE_SERVICES" ] || ANNOUNCE_SERVICES="\"photon\":\"$$PUBLIC_IP:22002\",\"turn\":\"$$PUBLIC_IP:3478\",\"stun\":\"$$PUBLIC_IP:3478\""
+        while true; do
+          cores=$$(nproc)
+          ram=$$(awk '/MemTotal/ {print int($$2/1024)}' /proc/meminfo)
+          disk=$$(df -Pk /host | awk 'NR==2 {print int($$2*1024/1000000000)}')
+          ssd=$$DISK_SSD
+          if [ "$$ssd" = auto ]; then
+            ssd=false
+            for f in /sys/block/*/queue/rotational; do
+              case "$$f" in */loop*|*/zram*|*/ram*|*/dm-*) continue ;; esac
+              [ "$$(cat "$$f" 2>/dev/null)" = 0 ] && ssd=true
+            done
+          fi
+          body="{\"services\":{$$ANNOUNCE_SERVICES},\"report\":{\"cores\":$$cores,\"ram_mb\":$$ram,\"disk_gb\":$$disk,\"disk_ssd\":$$ssd,\"ipv4\":\"$$PUBLIC_IP\",\"ipv6\":\"$$PUBLIC_IPV6\",\"port_mbps\":$$PORT_MBPS}}"
+          resp=$$(curl -fsS -4 -m 15 -X POST "$$FEDERATION_URL/announce" \
+            -H "Authorization: Bearer $$KEY" -H "Content-Type: application/json" -d "$$body") || echo "announce failed"
+          case "$$resp" in
+            *'"problems":['[!]]*) echo "out of rotation: $$resp" ;;
+          esac
+          case "$$resp" in
+            *'"selftest_due":true'*)
+              rtt=$$(curl -4 -sS -o /dev/null -m 10 -w '%{time_connect}' "$$FEDERATION_URL/../regions" | awk '{print int($$1*1000)}')
+              bytes=$$(curl -fsS -4 -m 70 -o /dev/null -w '%{size_download}' -H "Authorization: Bearer $$KEY" "$$FEDERATION_URL/selftest") \
+                || echo "self-test download refused or failed"
+              if [ -n "$$bytes" ] && [ "$$bytes" -gt 0 ]; then
+                head -c "$$bytes" /dev/zero | curl -fsS -4 -m 70 -X POST -T - -H "Authorization: Bearer $$KEY" \
+                  -H "Content-Type: application/octet-stream" -H "X-OpenPak-RTT-Ms: $$rtt" "$$FEDERATION_URL/selftest" \
+                  || echo "self-test upload refused or failed"
+              fi
+              ;;
+          esac
+          sleep 60
+        done
+
+volumes:
+  photon-data:
+  announce-state:
