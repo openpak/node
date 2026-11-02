@@ -26,7 +26,6 @@ podman compose up -d
 ## Docs
 
 - [Protocol](docs/protocol.md)
-- [Evidence](docs/evidence.md)
 - [Deploy](docs/deploy.md)
 - [Notes](docs/notes.md)
 - [Docs index](docs/README.md)
