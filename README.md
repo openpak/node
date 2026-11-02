@@ -27,8 +27,8 @@ podman compose up -d
 
 - [Protocol](docs/protocol.md)
 - [Deploy](docs/deploy.md)
-- [Notes](docs/notes.md)
-- [Docs index](docs/README.md)
+
+PRDs: openpak/prds (private)
 
 ## Licence
 

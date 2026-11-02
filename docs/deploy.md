@@ -27,3 +27,9 @@
   reaches nx-baas (`OPENPAK_BAAS_URL`) to learn a player's country.
 - Home's Stardew gets `OPENPAK_REGIONS_URL=https://openpak.org/api/v1/regions`.
 - The website needs nothing new; `/api/v1/regions` and the announce route are in the build.
+
+## Planned: OpenPak Node OS
+
+The compose recipe above is how a node runs today. The planned replacement is Fedora CoreOS
+with the node's services as podman quadlets, managed by a signed node agent. The agent is not
+built yet; nothing here depends on it.
